@@ -1,0 +1,479 @@
+---
+title: "Saezlab basic transcriptomic analysis template"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+author: 
+  - Saezlab
+output: 
+  rmdformats::downcute
+---
+
+# About
+
+This is a boilerplate for general transcriptomic analyses using limma for differential expression and Saezlab tools for the advanced analyses. It contains the following analysis types:
+
+- Bulk RNA-Seq data quality control and normalization
+- Differential expression analysis (using limma)
+- Functional analysis with MSigDB and decoupleR
+- Footprint-based analysis with DoRothEA and PROGENy
+
+The HTML document is knit using the `rmdformats` package to the working directory. Currently, there is no GitHub Actions workflow to automatically publish analysis HTML files, so distribution and publishing has to be performed manually.
+
+# Setup 
+
+## Package installation
+
+```{r, message=FALSE}
+# CRAN packages
+cran_packages <- c("tidyverse", "msigdbr", "BiocManager")
+for (i in cran_packages) {
+  if (!i %in% rownames(installed.packages()))
+    install.packages(i)
+}
+
+# BioC packages
+bioc_packages <-
+  c("decoupleR", "progeny", "dorothea", "limma", "edgeR", "decoupleR")
+for (i in bioc_packages) {
+  if (!i %in% rownames(installed.packages()))
+    BiocManager::install(i, update = FALSE)
+} 
+```
+
+Analysing RNA-Seq data using `limma` and `edgeR`: [Law et al. 2016](https://f1000research.com/articles/5-1408/v3). 
+Alternative using `DESeq2`: [tutorial](http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html).
+
+## Load packages and data
+
+```{r, warning=F, message=F}
+success <- lapply(c(cran_packages, bioc_packages), require, character.only = TRUE)
+if(!all(unlist(success))) print("There seems to be a problem loading one or more packages.")
+```
+
+Placeholder expression and meta data from ["Genomic Characterization of Cisplatin Response Uncovers Priming of Cisplatin-Induced Genes in a Resistant Cell Line"](https://www.mdpi.com/1422-0067/22/11/5814).
+
+```{r, message=FALSE}
+counts <-
+  read.table(
+    "data/counts.tsv",
+    header = TRUE,
+    sep = "\t",
+    row.names = 1
+  )
+metadata <- readr::read_tsv("data/metadata.tsv")
+```
+
+## Glimpse at expression
+
+```{r}
+head(counts)
+```
+
+## Glimpse at metadata 
+
+```{r}
+metadata %>% glimpse()
+```
+
+# Quality control and pre-processing
+
+## Check library size
+
+```{r}
+data.frame(sample = colnames(counts), n_counts = colSums(counts)) %>%
+  ggplot2::ggplot(aes(x = sample, y = n_counts)) +
+  ggplot2::geom_col() +
+  ggplot2::scale_y_continuous()
+```
+
+## Filter lowly expressed genes
+
+```{r}
+min_counts <- 10
+
+# apply fitlerByExpr function to retrieve a boolean vector indicating which genes should be retained
+design_matrix <- model.matrix( ~ 0 + group, data = metadata)
+keep <- edgeR::filterByExpr(counts, design = design_matrix, min.count = min_counts)
+
+# use the boolean vector to filter the count matrix
+counts_filtered <- counts[keep,]
+
+# print a message to show the number of genes that are retrieved after filtering
+message(
+  "From ",
+  nrow(counts),
+  " genes, removing ",
+  sum(!keep),
+  " using filterByExpr(). The resulting count matrix contains ",
+  nrow(counts_filtered),
+  " genes."
+)
+```
+
+Per-sample count distributions
+
+```{r}
+plot_count_distribution <- function(c) {
+  
+  p <- c %>%
+    tibble::rownames_to_column(var = "gene_symbol") %>%
+    tidyr::pivot_longer(-gene_symbol, names_to = "sample", values_to = "n_counts") %>%
+    ggplot2::ggplot(aes(x = log2(n_counts + 1), fill = sample)) +
+    ggplot2::geom_histogram(binwidth = 0.1) +
+    ggplot2::facet_grid(rows = vars(sample))
+  
+  return(p)
+  
+}
+```
+
+Unfiltered counts
+
+```{r}
+plot_count_distribution(counts) + 
+  ggplot2::ggtitle("Not filtered")
+```
+
+Filtered counts
+
+```{r}
+plot_count_distribution(counts_filtered) + 
+  ggplot2::ggtitle("Filtered")
+```
+
+# Normalisation
+
+We use the `calcNormFactors()` function from `edgeR` to calculate scaling factors for each sample. It uses the trimmed mean of M values (TMM), described in [Robinson et al. 2010](https://genomebiology.biomedcentral.com/articles/10.1186/gb-2010-11-3-r25).
+
+```{r}
+# create DGEList object
+dge <-
+  edgeR::DGEList(counts = counts_filtered, group = metadata$group)
+
+# apply normalization function
+dge_norm <- edgeR::calcNormFactors(dge, method = "TMM")
+```
+
+Generate a matrix of normalized gene expression values, using counts per million (CPM), and a $\log_2$ transformation.
+
+```{r}
+norm_expr <- edgeR::cpm(dge_norm, log = TRUE)
+```
+
+Glimpse at normalised expression
+
+```{r}
+head(norm_expr)
+```
+
+# Differential Expression Analysis
+
+```{r}
+# create the contrast matrix
+contrasts <- c("groupresistant-groupsensitive")
+contrast_matrix <-
+  limma::makeContrasts(contrasts = contrasts,
+                       levels = design_matrix)
+
+# create linear model
+fit <- limma::lmFit(norm_expr, design = design_matrix)
+
+# fit contrasts
+# "The coefficients, unscaled standard deviations and correlation matrix are re-calculated in terms of the contrasts."
+fit_contrasts <-
+  limma::contrasts.fit(fit, contrasts = contrast_matrix)
+
+# compute moderated statistics using the global parameteres
+ebayes_fit <- limma::eBayes(fit_contrasts)
+
+# retrieve table of differentially expressed genes
+de_table <- limma::topTable(ebayes_fit, number = Inf) %>%
+  tibble::rownames_to_column(var = "gene")
+```
+
+## Glimpse at DE
+
+```{r}
+head(de_table)
+```
+
+For more information about limma's output, please see [here](https://support.bioconductor.org/p/6124/).
+
+## DE summary
+
+```{r}
+summary(de_table)
+```
+
+## Distribution of the adjusted P values
+
+```{r}
+ggplot2::ggplot(de_table, aes(x = adj.P.Val)) +
+  ggplot2::geom_histogram()
+```
+
+## Volcano plot
+
+```{r}
+# set cutoffsa
+p_cutoff <- 0.0001
+fc_cutoff <- 2
+
+# annotate de_table with status according to cutoffs
+de_table <- de_table %>%
+  dplyr::mutate(
+    status = dplyr::case_when(
+      logFC >= fc_cutoff & adj.P.Val <= p_cutoff ~ "Up",
+      logFC <= -fc_cutoff & adj.P.Val <= p_cutoff ~ "Down",
+      TRUE ~ "Other"
+    )
+  )
+
+#  volcano plots
+ggplot2::ggplot(de_table, aes(x = logFC,-log10(adj.P.Val), color = status)) +
+  ggplot2::geom_point() +
+  ggplot2::geom_vline(xintercept = log2(c(0.25, 0.5, 2, 4)), lty = 2) +
+  ggplot2::geom_hline(yintercept = -log10(c(0.05, 0.01, 0.001, 0.0001)), lty = 2) +
+  ggplot2::scale_color_manual(values = c(
+    "Up" = "red",
+    "Down" = "blue",
+    "Other" = "black"
+  ))
+```
+
+# Functional analyses
+
+![](https://github.com/saezlab/decoupleR/raw/master/inst/figures/graphical_abstract.png?raw=1)
+
+We perform the functional analysis using decoupleR. As `decoupleR` functions expect a matrix as input, we are going to create a one-column matrix from the `de_table` object. This one column matrix contains the vector of T values obtained from limma. We choose the T values over other metrics because it combines the confidence and magnitude values of differential expression.
+
+```{r}
+# create matrix
+decoupler_input <- tibble::column_to_rownames(de_table, "gene") %>%
+  dplyr::select(t) %>%
+  dplyr::arrange(desc(t)) %>%
+  as.matrix()
+```
+
+## T value distribution
+
+```{r}
+de_table %>%
+  dplyr::arrange(desc(t)) %>%
+  dplyr::mutate(gene = forcats::fct_inorder(gene)) %>%
+  ggplot2::ggplot(aes(x = t)) +
+  ggplot2::geom_histogram(binwidth = 10) 
+```
+
+## Load MSigDB data
+
+Data from the [Molecular Signatures Database (MSigDB) database](https://www.gsea-msigdb.org/gsea/msigdb/), dataset [WikiPathways](https://www.wikipathways.org/index.php/WikiPathways).
+
+```{r}
+# retrieve GO terms table
+wikipathways <- msigdbr::msigdbr(species = "Homo sapiens",
+                                 category = "C2",
+                                 subcategory = "CP:WIKIPATHWAYS")
+```
+
+Glimpse at dataset
+
+```{r}
+head(wikipathways)
+```
+
+Transform into `decoupleR`-compatible format
+
+```{r}
+# helper function to transform msigdb data frames into decoupler compatible data frames
+msigdb_to_decoupler <- function(df) {
+  
+  output <- df %>%
+    dplyr::transmute(
+      source = gs_name,
+      target = gene_symbol,
+      mor = 1,
+      likelihood = 1
+    ) %>%
+    dplyr::distinct()
+  return(output)
+  
+}
+
+# apply to data frame
+wiki_decoupler <- msigdb_to_decoupler(wikipathways)
+```
+
+## Over-representation Analysis (ORA)
+
+We select the **top N** up and down regulated genes according to their T values and evaluate which functional categories are over-represented using the `run_ora()` function from `decoupleR`:
+
+```{r}
+# set the top N
+n_top <- 50
+
+# run for up-regulated genes using n_up
+ora_up <- decoupleR::run_ora(
+  mat = decoupler_input,
+  network = wiki_decoupler,
+  n_up = n_top,
+  n_bottom = 0,
+  .source = "source",
+  .target = "target"
+) %>%
+  dplyr::mutate(adj_p = p.adjust(p_value, method = "BH"))
+
+# run for down-regulated genes using n_bottom
+ora_down <- decoupleR::run_ora(
+  mat = decoupler_input,
+  network = wiki_decoupler,
+  n_up = 0,
+  n_bottom = n_top,
+  .source = "source",
+  .target = "target"
+) %>%
+  dplyr::mutate(adj_p = p.adjust(p_value, method = "BH"))
+
+# bind both data frames
+ora_results <- list(Up = ora_up, Down = ora_down) %>%
+  dplyr::bind_rows(.id = "status") %>%
+  dplyr::arrange(p_value)
+```
+
+Plot the top 10 up- and down-regulated functional categories:
+
+```{r, fig.width=10, fig.height=3.5}
+# plot them
+ora_results %>%
+  dplyr::group_by(status) %>%
+  dplyr::slice_head(n = 10) %>%
+  dplyr::mutate(source = forcats::fct_rev(forcats::fct_inorder(source))) %>%
+  ggplot2::ggplot(aes(x = -log10(p_value), y = source, fill = status)) +
+  ggplot2::geom_bar(stat = "identity") +
+  ggplot2::scale_fill_manual(values = c("Up" = "red", "Down" = "blue")) 
+```
+
+## Set Enrichment Analysis (SEA)
+
+We perform enrichment using the `run_wmean()` function from the `decoupleR` package. This function will perform a weighted mean of the T values from genes that belong to a given functional category. In this example, we only use a weight of 1 to indicate whether a gene belongs to a pathway. More sophisticated analyses can be carried out using both the `.mor` and `.likelihood` parameters. We now carry out the Functional Class Scoring (FCS)-like analysis using `decoupleR`:
+
+```{r}
+wmean_results <- run_wmean(
+  mat = decoupler_input,
+  network = wiki_decoupler,
+  times = 2000,
+  .source = "source",
+  .target = "target",
+  .mor = "mor",
+  .likelihood = "likelihood"
+) %>%
+  subset(statistic == "norm_wmean") %>%
+  dplyr::mutate(adj_p = p.adjust(p_value, method = "BH"))
+```
+
+Plot the top 10 up and down regulated pathways according to the results of the `run_wmean()` function:
+
+```{r, fig.width=10, fig.height=3.5}
+plot_fcs_results <- function(df) {
+  
+  p <- df %>%
+    dplyr::mutate(status = ifelse(score > 0, "Up", "Down")) %>%
+    dplyr::arrange(p_value) %>%
+    dplyr::group_by(status) %>%
+    dplyr::slice_head(n = 10) %>%
+    dplyr::arrange(score) %>%
+    dplyr::mutate(source = forcats::fct_inorder(source)) %>%
+    ggplot2::ggplot(aes(x = score, y = source, fill = status)) +
+    ggplot2::geom_bar(stat = "identity") +
+    ggplot2::scale_fill_manual(values = c("Up" = "red", "Down" = "blue"))
+  
+  return(p)
+  
+}
+
+plot_fcs_results(wmean_results)
+```
+
+# Footprint-based analyses
+
+DoRothEA and PROGENy are prior knowledge resources which we can couple with a statistical method to extract insights about biological activities from transcriptomic data.
+
+## DoRothEA
+
+We use [DoRothEA](https://github.com/saezlab/dorothea) to define TF-gene regulatory mechanisms and perform TF activity estimation.
+
+```{r}
+dorothea_interactions <- dorothea::dorothea_hs %>%
+  subset(confidence %in% c("A", "B", "C")) %>%
+  dplyr::mutate(likelihood = 1)
+
+head(dorothea_interactions)
+```
+
+We apply the `run_wmean()` function from `decoupler` using the functional sets defined by DoRothEA TFs.
+
+```{r}
+tf_activity_results <- run_wmean(
+  mat = decoupler_input, 
+  network =dorothea_interactions, 
+  times = 2000,
+  .source = "tf",
+  .target = "target",
+  .mor = "mor",
+  .likelihood = "likelihood"
+) %>%
+  subset(statistic == "norm_wmean") %>%
+  dplyr::mutate(adj_p = p.adjust(p_value, method = "BH"))
+```
+
+Visualize the top altered TFs
+
+```{r}
+plot_fcs_results(tf_activity_results)
+```
+
+## PROGENy
+
+We use [PROGENy](https://github.com/saezlab/progeny) to connect transcriptomic changes to protein signalling pathway perturbations.
+
+```{r}
+# adapt progeny interactions to decoupler format
+progeny_interactions <-
+  progeny::getModel(organism = "Human", top = 300) %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "target") %>%
+  tidyr::pivot_longer(-target, names_to = "pathway", values_to = "weight") %>%
+  subset(weight != 0) %>%
+  dplyr::mutate(mor = sign(weight), likelihood = abs(weight))
+
+# show the first interactions
+head(subset(progeny_interactions, weight != 0))
+```
+
+Perform the pathway activity estimation using `decoupler`.
+
+```{r}
+progeny_results <- run_wmean(
+  mat = decoupler_input,
+  network = progeny_interactions,
+  times = 2000,
+  .source = "pathway",
+  .target = "target",
+  .mor = "mor",
+  .likelihood = "likelihood"
+) %>%
+  subset(statistic == "norm_wmean") %>%
+  dplyr::mutate(adj_p = p.adjust(p_value, method = "BH"))
+```
+
+Visualize the results
+
+```{r}
+plot_fcs_results(progeny_results)
+```
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+
